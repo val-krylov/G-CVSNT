@@ -16,6 +16,7 @@
 #include "buffer.h"
 #include "savecwd.h"
 #include "sha_blob_reference.h"
+#include "access_log.h"
 #include "../ca_blobs_fs/streaming_blobs.h"
 #include <../keyValueServer/include/blob_sockets.h>
 #include <../keyValueServer/include/blob_hash_util.h>
@@ -2805,7 +2806,7 @@ static int server_notify ()
 				notify_list->time, notify_list->hostname, notify_list->pathname, notify_list->watches, repos, notify_list->tag, notify_list->flags, notify_list->bugid, notify_list->message);
 
 		}
-		buf_output0 (buf_to_net, "Notified ");
+buf_output0 (buf_to_net, "Notified ");
 		{
 			char *dir = notify_list->dir + strlen (server_temp_dir) + 1;
 			if (dir[0] == '\0')
@@ -3280,6 +3281,8 @@ error  \n");
 	lib.CloseAllTriggers(); /* This command has finished */
 	tf_loaded=false;
 
+	access_log_flush (); /* before the client sees "ok" */
+
 	if (errs)
 		/* We will have printed an error message already.  */
 		buf_output0 (buf_to_net, "error  \n");
@@ -3423,6 +3426,7 @@ int send_rename_to_client(const char *oldfile, const char *newfile)
 {
 	if(supported_response("Rename"))
 	{
+		cvs_direct_response_begin();
 		buf_output0(buf_to_net,"Rename ");
 		server_buf_output0(buf_to_net,oldfile);
 		buf_output0(buf_to_net,"\n");
@@ -3441,6 +3445,7 @@ int server_rename_file(const char *oldfile, const char *newfile)
 {
 	if(supported_response("Renamed"))
 	{
+		cvs_direct_response_begin();
 		buf_output0(buf_to_net,"Renamed ./\n");
 		server_buf_output0(buf_to_net,oldfile);
 		buf_output0(buf_to_net,"\n");
@@ -3459,7 +3464,8 @@ int reset_client_mapping(const char *update_dir, const char *repository)
 {
 	if(supported_response("Clear-rename"))
 	{
-		buf_output0(buf_to_net,"Clear-rename ");
+		cvs_direct_response_begin ();
+buf_output0(buf_to_net,"Clear-rename ");
 	    output_dir (update_dir, repository);
 	    buf_output0(buf_to_net,"\n");
 	}
@@ -3664,6 +3670,9 @@ static void serve_ci (char *arg)
 
 static void checked_in_response (const char *file, const char *update_dir, const char *repository)
 {
+	/* Checked-in and the entries lines go straight to buf_to_net; the
+	   file's "Checking in ..." progress text is usually still staged.  */
+	cvs_direct_response_begin ();
     if (supported_response ("Mode"))
     {
 	struct stat sb;
@@ -3704,6 +3713,7 @@ void server_checked_in (const char *file, const char *update_dir, const char *re
 	 * This happens if we are now doing a "cvs remove" after a previous
 	 * "cvs add" (without a "cvs ci" in between).
 	 */
+		cvs_direct_response_begin ();
 		buf_output0(buf_to_net,"Remove-entry ");
 		output_dir (update_dir, repository);
 		server_buf_output0(buf_to_net,file);
@@ -3775,6 +3785,7 @@ void server_update_entries (const char *file, const char *update_dir, const char
     {
 		if (!supported_response ("New-entry"))
 			return;
+		cvs_direct_response_begin();
 		buf_output0(buf_to_net,"New-entry ");
 		output_dir (update_dir, repository);
 		server_buf_output0(buf_to_net,file);
@@ -4077,6 +4088,11 @@ static void serve_expand_modules(char *arg)
 
 static void serve_noop (char *arg)
 {
+	/* edit/unedit notifications are logged from here, not from a command routed
+	   through do_cvs_command, so name the command "noop" rather than leaving
+	   $cmd as the preceding command. */
+	const char *saved_command_name = server_command_name;
+	server_command_name = "noop";
 
     server_write_entries();
 	server_write_renames();
@@ -4084,6 +4100,9 @@ static void serve_noop (char *arg)
 		buf_output0 (buf_to_net, "error \n");
 	else
 		buf_output0 (buf_to_net, "ok\n");
+	access_log_flush (); /* server_notify may have logged edit/unedit records */
+
+	server_command_name = saved_command_name;
     buf_flush (buf_to_net, 1);
 }
 
@@ -4321,6 +4340,7 @@ void server_copy_file (const char *file, const char *update_dir, const char *rep
 
     if (!supported_response ("Copy-file"))
 		return;
+	cvs_direct_response_begin ();
 	buf_output0(buf_to_net,"Copy-file ");
     output_dir (update_dir, repository);
 	server_buf_output0(buf_to_net,file);
@@ -4347,6 +4367,7 @@ void server_modtime (struct file_info *finfo, Vers_TS *vers_ts)
 	   circumstances.  */
 	return;
     date_to_internet (outdate, date);
+	cvs_direct_response_begin ();
 	buf_output0(buf_to_net,"Mod-time ");
 	buf_output0(buf_to_net,outdate);
 	buf_output0(buf_to_net,"\n");
@@ -4377,6 +4398,10 @@ void server_updated (
 	}
 	return;
     }
+
+	/* Updated/Created/Merged and the payload go straight to buf_to_net;
+	   the status letter for this file is usually still staged.  */
+	cvs_direct_response_begin ();
 
     if (entries_line != NULL && scratched_file == NULL)
     {
@@ -4476,6 +4501,23 @@ void server_updated (
 
 	new_entries_ex_line();
 
+	/* Prepare the access-log read record here, where filebuf still holds the
+	   blob reference, but defer writing it until the payload has actually been
+	   queued below -- a read that fails mid-transfer must not be recorded. */
+	const char *al_kind = NULL;
+	char al_hash[hash_encoded_size + 1] = "";
+	if (access_log_enabled)
+	{
+	    al_kind = updated == SERVER_BLOB_REF ? "blobref"
+		    : updated == SERVER_MERGED ? "merged"
+		    : updated == SERVER_PATCHED ? "patched"
+		    : updated == SERVER_RCS_DIFF ? "rcsdiff"
+		    : updated == SERVER_UPDATED_META ? "meta"
+		    : "updated";
+	    if (updated == SERVER_BLOB_REF && filebuf != NULL)
+		get_blob_reference_content_hash ((const unsigned char *) filebuf->data->bufp, blob_reference_size, al_hash);
+	}
+
 	if (updated == SERVER_UPDATED)
 	{
 	    Node *node;
@@ -4552,13 +4594,22 @@ void server_updated (
                 TRACE(3,"read and output file %s (%s)", finfo->file, finfo->fullname);
     			f = CVS_FOPEN (finfo->file, "rb");
     			if (f == NULL)
+    			{
+    				CServerIo::log (CServerIo::logError, "cannot read %s to send to client: %s", finfo->file, strerror (errno));
     				error (1, errno, "reading %s", fn_root(finfo->fullname));
+    			}
     			status = buf_read_file (f, size, &list, &last);
     			if (status != 0)
+    			{
+    				CServerIo::log (CServerIo::logError, "failed reading %s to send to client", finfo->file);
     				error (1, ferror (f) ? errno : 0, "reading %s",
     				   fn_root(finfo->fullname));
+    			}
     			if (fclose (f) == EOF)
+    			{
+    				CServerIo::log (CServerIo::logError, "cannot close %s after sending to client: %s", finfo->file, strerror (errno));
     				error (1, errno, "reading %s", fn_root(finfo->fullname));
+    			}
     	    }
     	}
 
@@ -4582,6 +4633,12 @@ void server_updated (
     	    buf_free (filebuf);
     	}
     }
+
+	/* The payload is queued; now it is safe to record the read. */
+	if (al_kind)
+	    access_log_file ("read", al_kind, finfo->update_dir, finfo->repository, finfo->file,
+			     vers ? vers->vn_rcs : NULL, NULL, al_hash,
+			     updated == SERVER_UPDATED_META ? 0 : size);
 	/* Note we only send a newline here if the file ended with one.  */
 
 	/*
@@ -4622,6 +4679,11 @@ void server_updated (
 		buf_output0(buf_to_net,"Removed ");
 	else
 		buf_output0(buf_to_net,"Remove-entry ");
+	/* Remove-entry is entry bookkeeping (e.g. after committing a removal);
+	   only a real "Removed" means the client lost a file. */
+	if (access_log_enabled && kill_scratched_file)
+	    access_log_file ("read", "removed", finfo->update_dir, finfo->repository,
+			     finfo->file, vers ? vers->vn_rcs : NULL, NULL, NULL, 0);
 	output_dir (finfo->update_dir, finfo->repository);
 	server_buf_output0(buf_to_net,finfo->file);
 	buf_output0(buf_to_net,"\n");
@@ -4670,7 +4732,8 @@ void server_set_entstat (const char *update_dir, const char *repository)
 	set_static_supported = supported_response ("Set-static-directory");
     if (!set_static_supported) return;
 
-    buf_output0(buf_to_net,"Set-static-directory ");
+    cvs_direct_response_begin ();
+buf_output0(buf_to_net,"Set-static-directory ");
     output_dir(update_dir, repository);
     buf_output0(buf_to_net,"\n");
 }
@@ -4685,7 +4748,8 @@ void server_clear_entstat (const char *update_dir, const char *repository)
     if (noexec)
 		return;
 
-    buf_output0(buf_to_net,"Clear-static-directory ");
+    cvs_direct_response_begin ();
+buf_output0(buf_to_net,"Clear-static-directory ");
     output_dir (update_dir, repository);
     buf_output0(buf_to_net,"\n");
 }
@@ -4711,7 +4775,8 @@ void server_set_sticky (const char *update_dir, const char *repository, const ch
     }
     else 
     {
-		buf_output0(buf_to_net,"Set-sticky ");
+		cvs_direct_response_begin ();
+buf_output0(buf_to_net,"Set-sticky ");
 		output_dir (update_dir, repository);
 		buf_output0(buf_to_net,"\n");
 		if (tag != NULL)
@@ -4769,7 +4834,8 @@ static int template_proc (void *params, const trigger_interface *cb)
 			TRACE(3,"get_template returned success, so send the %d long template to client.",(int)template_ptr_len);
 			TRACE(4,"get_template sending \"%s\".",template_ptr);
 			char buf[32];
-			buf_output0(buf_to_net,"Template ");
+			cvs_direct_response_begin ();
+buf_output0(buf_to_net,"Template ");
 			output_dir (data->update_dir, data->repository);
 			buf_output0(buf_to_net,"\n");
 			snprintf(buf,sizeof(buf),"%ld\n",template_ptr_len);
@@ -5058,6 +5124,11 @@ void server_cleanup (int sig)
 
   server_cleanup_already_done = true;
 
+  /* Only on normal or error_exit cleanup (sig == 0); flushing from a real
+     signal handler could re-enter a half-updated access-log buffer. */
+  if (sig == 0)
+    access_log_flush ();
+
     /* Do "rm -rf" on the temp directory.  */
     int status;
     int save_noexec;
@@ -5339,9 +5410,16 @@ error ENOMEM Virtual memory exhausted.\n");
     
 	orig_cmd = cmd;
 	for (rq = requests; rq->name != NULL; ++rq)
-	    if (strncmp (cmd, rq->name, strlen (rq->name)) == 0)
+	{
+	    int len;
+	    /* Nearly every row fails on the first character; rejecting on it
+	       here spares a strlen and a strncmp call per non-matching row
+	       on a loop that runs for every protocol request.  */
+	    if (rq->name[0] != *cmd)
+		continue;
+	    len = strlen (rq->name);
+	    if (strncmp (cmd, rq->name, len) == 0)
 	    {
-            int len = strlen (rq->name);
             if (cmd[len] == '\0')
 	            cmd += len;
             else if (cmd[len] == ' ')
@@ -5405,6 +5483,7 @@ error ENOMEM Virtual memory exhausted.\n");
 			buf_send_output(stdout_buf);
 		break;
 	    }
+	}
 	if (rq->name == NULL)
 	{	
         buf_output0 (buf_to_net, "error  unrecognized request `");
@@ -6412,9 +6491,21 @@ int cvs_output_raw(const char *str, size_t len, bool flush)
    the first '\0' byte.  */
 #include <mutex>
 static std::mutex output_mutex;
+/* Bytes cvs_output has staged for the client since the last flush it
+   issued itself; when it exceeds this threshold, the next completed
+   line is pushed to the network.  */
+#define SERVER_FLUSH_THRESHOLD 8192
+static size_t pending_output;
 int cvs_output (const char *str, size_t len)
 {
-	cvs_flusherr();
+	/* Interleave pending stderr before this stdout - but in server mode
+	   only when stderr is actually staged: an unconditional flush here
+	   pushes buf_to_net on every line, the per-line write the batching
+	   removes.  Direct callers (lock waits) still reach the socket.  */
+#ifdef SERVER_SUPPORT
+	if(!server_active || (stderr_buf && !buf_empty_p(stderr_buf)))
+#endif
+		cvs_flusherr();
     if (len == 0)
 		len = strlen (str);
 	if(!len)
@@ -6456,8 +6547,20 @@ int cvs_output (const char *str, size_t len)
 			len=olen;
 		}
  		buf_output (stdout_buf?stdout_buf:buf_to_net, str, len);
- 		if(str[len-1]=='\n')
+		pending_output += len;
+		/* Before server() nothing drains: pserver auth replies.  */
+ 		if(str[len-1]=='\n' && (!stdout_buf || pending_output >= SERVER_FLUSH_THRESHOLD))
+		{
+			pending_output = 0;
  			buf_send_output(stdout_buf?stdout_buf:buf_to_net);
+			/* Drain the wrap into buf_to_net, then push buf_to_net to the
+			   socket non-blocking: without this the batched output only
+			   moves between in-memory buffers and one big body (log or
+			   annotate on a single file, checkout -p) is held whole in
+			   server memory until command end.  */
+			if(stdout_buf)
+				buf_flush(buf_to_net, 0);
+		}
 		if(ostr) xfree(ostr);
     }
 	else
@@ -6506,13 +6609,38 @@ int cvs_output (const char *str, size_t len)
 	return len;
 }
 
+/* Every response written straight to buf_to_net must call this first:
+   cvs_output stages M text (and cvs_outerr can stage E text), and a
+   direct write would overtake anything not yet pushed to the wire.  */
+void cvs_direct_response_begin ()
+{
+#ifdef SERVER_SUPPORT
+	if (server_active && !temp_protocol)
+	{
+		/* Only drain when something is staged: flushing an empty wrap
+		   buffer still pushes buf_to_net to the socket, one write per
+		   response - the very cost the output batching removed.  */
+		if (stderr_buf && !buf_empty_p (stderr_buf))
+			cvs_flusherr ();
+		if (stdout_buf && !buf_empty_p (stdout_buf))
+			cvs_flushout ();
+		return;
+	}
+#endif
+	cvs_flusherr ();
+	cvs_flushout ();
+}
+
 #ifdef SERVER_SUPPORT
 int cvs_no_translate_begin()
 {
 	if(!server_active)
 		return 0;
 	if(supported_response("NoTranslateBegin"))
+	{
+		cvs_direct_response_begin ();
 		buf_output0 (buf_to_net, "NoTranslateBegin\n");
+	}
 	return 0;
 }
 
@@ -6521,7 +6649,10 @@ int cvs_no_translate_end()
 	if(!server_active)
 		return 0;
 	if(supported_response("NoTranslateEnd"))
+	{
+		cvs_direct_response_begin ();
 		buf_output0 (buf_to_net, "NoTranslateEnd\n");
+	}
 	return 0;
 }
 #endif
@@ -6531,7 +6662,8 @@ int cvs_no_translate_end()
 
 int cvs_output_binary (char *str, size_t len)
 {
-	cvs_flusherr();
+	/* Mbinary is written straight to buf_to_net below.  */
+	cvs_direct_response_begin();
 #ifdef SERVER_SUPPORT
     if (server_active)
     {
@@ -6719,7 +6851,10 @@ cvs_flusherr ()
 	/* skip the actual stderr flush in this case since the parent process
 	 * on the server should only be writing to stdout anyhow
 	 */
-	/* Flush what we can to the network, but don't block.  */
+	/* Flush what we can to the network, but don't block.  Even an empty
+	   wrap flush pushes buf_to_net, which is what lets a lock wait's
+	   progress line reach the client at once; cvs_output guards its own
+	   call so the per-line push the batching removes does not come back.  */
 	if(stderr_buf)
 		buf_flush (stderr_buf, 0);
     }
@@ -6757,6 +6892,33 @@ cvs_flushout ()
     }
 }
 
+/* The per-file progress flush in the recursion processor.  Local mode
+   flushes unconditionally, as it always did.  In server mode, skip the
+   flush while there is no staged M/E text and the network queue is still
+   a single chunk - flushing a few hundred bytes per file is what turned a
+   big checkout into per-file write()s.  Once any wrapped text is pending,
+   or a *second* chunk has been allocated, flush as before.
+
+   Note the bound: the test below is on the chunk *list*, not on bytes, so
+   a single completely full chunk does not trigger it and the real ceiling
+   is roughly two chunks, not one.  BUFFER_DATA_SIZE is BUFSIZ*10, which
+   makes that about 160 KiB with glibc and about 10 KiB with the MSVC CRT -
+   a 16x spread across platforms.  Either way it is bounded, and per-file
+   progress still streams whenever there is text to show.  */
+void cvs_flushout_perfile ()
+{
+#ifdef SERVER_SUPPORT
+	if (server_active && !(temp_protocol && temp_protocol->server_flush_data))
+	{
+		if ((!stdout_buf || buf_empty_p (stdout_buf))
+		    && (!stderr_buf || buf_empty_p (stderr_buf))
+		    && (!buf_to_net || buf_chunk_count (buf_to_net) <= 1))
+			return;
+	}
+#endif
+	cvs_flushout ();
+}
+
 /* Output TEXT, tagging it according to TAG.  There are lots more
    details about what TAG means in cvsclient.texi but for the simple
    case (e.g. non-client/server), TAG is just "newline" to output a
@@ -6784,6 +6946,8 @@ void cvs_output_tagged (const char *tag, const char *text)
 #ifdef SERVER_SUPPORT
     if (server_active && supported_response ("MT"))
     {
+		/* MT goes straight to buf_to_net.  */
+		cvs_direct_response_begin ();
 		buf_output0 (buf_to_net, "MT ");
 		buf_output0 (buf_to_net, tag);
 		if (text != NULL)
@@ -7050,7 +7214,8 @@ void server_send_baserev(struct file_info *finfo, const char *basefile, const ch
 {
 	FILE *f;
 	unsigned long len;
-	buf_output0(buf_to_net,"Update-baserev ");
+	cvs_direct_response_begin ();
+buf_output0(buf_to_net,"Update-baserev ");
 	output_dir (finfo->update_dir, finfo->repository);
 	server_buf_output0(buf_to_net,finfo->file);
 	buf_output0(buf_to_net,"\n");

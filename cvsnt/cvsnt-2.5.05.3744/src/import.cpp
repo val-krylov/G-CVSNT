@@ -17,6 +17,7 @@
  */
 
 #include "cvs.h"
+#include "access_log.h"
 #include "fileattr.h"
 #include "savecwd.h"
 
@@ -658,6 +659,13 @@ static int import_descend (char *message, char *vtag, int targc, char *targv[])
                        {
                                t=time_stamp(p->key, 0);
                                r=wrap_rcsoption(p->key);
+                               /* Content beats name; the Kopt sent for the file says so aloud.  */
+                               const char *forced;
+                               if (content_kopt (p->key, r, 0, &forced) == CONTENT_KOPT_BINARY)
+                               {
+                                       xfree (r);
+                                       r = xstrdup (forced);
+                               }
 							   fprintf(f,"/%s/%s.1/%s/%s%s/\n",p->key,vbranch?vbranch:"1",t,r?"-k":"",r?r:"");
                                xfree(r);
                                xfree(t);
@@ -750,9 +758,34 @@ static int process_import_file (char *message, char *vfile, char *vtag, int targ
 	    }
 #endif
 
+	    /* Content beats name.  The kopt is the user's own only when it is the
+	       command-line -k itself (our_opt == keyword_opt); one the client sent
+	       in an entry was already vetted there.  Refusal stops the import,
+	       as it does on the client.  */
+	    {
+		int explicit_k = keyword_opt && keyword_opt[0] && our_opt == keyword_opt;
+		const char *forced;
+		switch (content_kopt (vfile, our_opt, explicit_k, &forced))
+		{
+		case CONTENT_KOPT_REFUSE:
+		    error (1, 0, "%s has binary content; refusing to import it with -k%s (use -kB)",
+			   vfile, keyword_opt);
+		case CONTENT_KOPT_BINARY:
+		    xfree (free_opt);
+		    free_opt = our_opt = xstrdup (forced);
+		    if (!server_active)
+			error (0, 0, "%s has binary content, importing it as -k%s", vfile, forced);
+		    break;
+		default:
+		    break;
+		}
+	    }
+
 	    retval = add_rcs_file (message, rcs, vfile, vhead, our_opt,
 				   vbranch, vtag, targc, targv,
 				   NULL, 0, logfp, NULL);
+	    if (retval == 0)
+		access_log_file ("write", "import", NULL, repository, fn, vhead, vtag, NULL, 0);
 		xfree (free_opt);
 	    xfree (rcs);
 	    return retval;
@@ -788,6 +821,25 @@ static int update_rcs_file(const char *fn, char *message, char *vfile, char *vta
     vers = Version_TS (&finfo, keyword_opt, vbranch, (char *) NULL, 1, 0, 0);
 	kflag kopt;
 	RCS_get_kflags(vers->options,false,kopt);
+	/* Content beats name here too: a re-import reaches this path over an
+	   existing ,v, and vers->options is that file's kopt.  Never let binary
+	   content land as a text revision.  */
+	const char *forced;
+	switch (content_kopt (vfile, vers->options, keyword_opt && keyword_opt[0], &forced))
+	{
+	case CONTENT_KOPT_REFUSE:
+	    error (1, 0, "%s has binary content; refusing to import it with -k%s (use -kB)",
+		   vfile, keyword_opt);
+	case CONTENT_KOPT_BINARY:
+	    xfree (vers->options);
+	    vers->options = xstrdup (forced);
+	    RCS_get_kflags (vers->options, false, kopt);
+	    if (!server_active)
+		error (0, 0, "%s has binary content, importing it as -k%s", vfile, forced);
+	    break;
+	default:
+	    break;
+	}
     if (vers->vn_rcs != NULL && !RCS_isdead(vers->srcfile, vers->vn_rcs))
     {
 		int different;
@@ -818,16 +870,41 @@ static int update_rcs_file(const char *fn, char *message, char *vfile, char *vta
 			if (add_tags (vers->srcfile, vfile, vtag, targc, targv))
 				retval = 1;
 			else
+			{
 				add_log ('U', (char*)fn);
+				access_log_file ("write", "import", NULL, finfo.repository, finfo.mapped_file, vers->vn_rcs, vtag, NULL, 0);
+			}
 			freevers_ts (&vers);
 			return (retval);
 		}
     }
 
+    /* The import -R path (absent source) routes add_rev through remove_file: a
+       removal, and a no-op when the leaf is already dead. Note both before
+       add_rev mutates the file, to log the right kind afterwards. */
+    int al_is_removal = single_file_remove && !isfile (vfile);
+    int al_removal_real = al_is_removal && vers->srcfile && vers->vn_rcs
+			  && !RCS_isdead (vers->srcfile, vers->vn_rcs);
+
     /* We may have failed to parse the RCS file; check just in case */
     if (vers->srcfile == NULL ||
-		add_rev (message, vers->srcfile, vfile, vers->vn_rcs, vers->options) ||
-		add_tags (vers->srcfile, vfile, vtag, targc, targv))
+		add_rev (message, vers->srcfile, vfile, vers->vn_rcs, vers->options))
+    {
+		freevers_ts (&vers);
+		return (1);
+    }
+    /* Record the write add_rev just made, before add_tags can fail: an import
+       for a normal add, or a remove for import -R when it killed a live
+       revision. vers->vn_rcs is the pre-import leaf (the removed revision, and
+       for an add the wrong leaf -- so an import passes no revision). */
+    if (al_is_removal)
+    {
+	if (al_removal_real)
+	    access_log_file ("write", "remove", NULL, finfo.repository, finfo.mapped_file, vers->vn_rcs, NULL, NULL, 0);
+    }
+    else
+	access_log_file ("write", "import", NULL, finfo.repository, finfo.mapped_file, NULL, vtag, NULL, 0);
+    if (add_tags (vers->srcfile, vfile, vtag, targc, targv))
     {
 		freevers_ts (&vers);
 		return (1);
@@ -1200,6 +1277,8 @@ add_rcs_file (
 	bool open_binary, encode;
 	CCodepage::Encoding encoding,targetencoding;
 	LineType crlf;
+	char *buf = NULL;
+	size_t len = 0;
 
     if (noexec)
 		return (0);
@@ -1291,6 +1370,43 @@ add_rcs_file (
 		}
 	}
 
+	/* Read the contents before the RCS file exists: storing a -kB body in
+	   the blob store can fail fatally, and must not leave a partial ,v.  */
+	if(add_vhead != NULL && fpuser)
+	{
+		fseek(fpuser,0,SEEK_END);
+		len = ftell(fpuser);
+		fseek(fpuser,0,SEEK_SET);
+		buf = (char*)xmalloc(len);
+
+		len = fread (buf, 1, len, fpuser);
+		if (len == 0)
+		{
+			if (ferror (fpuser))
+				error (1, errno, "cannot read file %s for copying", userfile);
+		}
+		if(encode)
+		{
+			void *newbuf = NULL;
+			CCodepage cdp;
+			int res;
+
+			cdp.BeginEncoding(encoding,targetencoding);
+			if((res=cdp.ConvertEncoding(buf,len,newbuf,len))>0)
+			{
+				xfree(buf);
+				buf = (char*)newbuf;
+			}
+			else if(res<0)
+				error(0,0,"Unable to convert from %s to UTF-8",local_opt_flags.encoding.encoding);
+			cdp.StripCrLf(buf,len);
+			cdp.EndEncoding();
+		}
+
+		if(local_opt_flags.flags & KFLAG_BINARY_DELTA)
+			RCS_write_binary_rev_data(rcs, buf, len, local_opt_flags.flags & KFLAG_COMPRESS_DELTA, true);
+	}
+
     fprcs = fopen (rcs, "w+b");
     if (fprcs == NULL)
     {
@@ -1353,7 +1469,7 @@ add_rcs_file (
 
     if (fprintf (fprcs, "locks    ; strict;\n") < 0 ||
 	/* XXX - make sure @@ processing works in the RCS file */
-	fprintf (fprcs, "comment  @%s@;\n", userfile?get_comment (userfile):"pnew file") < 0)
+	fprintf (fprcs, "comment  @%s@;\n", userfile?get_comment (userfile):"new file") < 0)
     {
 	goto write_error;
     }
@@ -1521,38 +1637,6 @@ add_rcs_file (
 		/* Now copy over the contents of the file, expanding at signs. */
 		if(fpuser)
 		{
-			char *buf;
-			size_t len;
-
-			fseek(fpuser,0,SEEK_END);
-			len = ftell(fpuser);
-			fseek(fpuser,0,SEEK_SET);
-			buf = (char*)xmalloc(len);
-
-			len = fread (buf, 1, len, fpuser);
-			if (len == 0)
-			{
-				if (ferror (fpuser))
-					error (1, errno, "cannot read file %s for copying", userfile);
-			}
-			if(encode)
-			{
-				void *newbuf = NULL;
-				CCodepage cdp;
-				int res;
-
-				cdp.BeginEncoding(encoding,targetencoding);
-				if((res=cdp.ConvertEncoding(buf,len,newbuf,len))>0)
-				{
-					xfree(buf);
-					buf = (char*)newbuf;
-				}
-				else if(res<0)
-					error(0,0,"Unable to convert from %s to UTF-8",local_opt_flags.encoding.encoding);
-				cdp.StripCrLf(buf,len);
-				cdp.EndEncoding();
-			}
-
 			if((local_opt_flags.flags & (KFLAG_BINARY_DELTA|KFLAG_COMPRESS_DELTA)) == KFLAG_COMPRESS_DELTA)
 			{
 				uLong zlen;
@@ -1634,6 +1718,7 @@ write_error_noclose:
     }
 read_error:
 
+	xfree (buf);
 	xfree (local_opt);
 
     return (err + 1);

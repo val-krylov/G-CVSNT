@@ -16,8 +16,8 @@
 
 static Node *AddEntryNode (List * list, Entnode *entnode);
 
-static Entnode *fgetentent(FILE *, char *, int *);
-static int fgetententex(List *entries, FILE *, char *);
+static Entnode *fgetentent(FILE *, char *, int *, char **, size_t *);
+static int fgetententex(List *entries, FILE *, char *, char **, size_t *);
 int   fputentent(FILE *, Entnode *);
 int   fputententex(FILE *, Entnode *);
 
@@ -94,24 +94,6 @@ static void Entnode_Destroy (Entnode *ent)
 	xfree (ent->md5);
 
     xfree (ent);
-}
-
-/*
- * Write out the line associated with a node of an entries file
- */
-static int write_ent_proc (Node *node, void *closure)
-{
-    Entnode *entnode;
-
-    entnode = (Entnode *) node->data;
-
-    if (closure != NULL && entnode->type != ENT_FILE)
-		*(int *) closure = 1;
-
-    if (fputentent(entfile, entnode))
-		error (1, errno, "cannot write %s", entfilename);
-
-    return (0);
 }
 
 /*
@@ -210,12 +192,14 @@ static void write_entries (List *list)
 	error (1, errno, "error closing %s", entfilename);
 
     /* now, atomically (on systems that support it) rename it */
-	/* First make a copy in the .Old files (note we don't rename so that the
-	   entries files always exist) */
+	/* This used to first byte-copy (and, on POSIX, fsync) the current
+	   files to CVS/Entries.Old and CVS/Entries.Extra.Old - two full file
+	   copies plus two fsyncs for every directory a command touched.
+	   Nothing in cvsnt reads the .Old files; they were only ever a
+	   convention for third-party frontends, and the rename below already
+	   replaces the live files atomically.  */
 	TRACE(3,"write_entries() now, atomically (on systems that support it) rename it ");
-	copy_file (CVSADM_ENT, CVSADM_ENTOLD, 1, 0);
     rename_file (entfilename, CVSADM_ENT);
-	copy_file (CVSADM_ENTEXT, CVSADM_ENTEXTOLD, 1, 0);
     rename_file (entexfilename, CVSADM_ENTEXT);
 
     /* now, remove the log file */
@@ -254,7 +238,6 @@ void Scratch_Entry (List *list, const char *fname)
 			if (fprintf (entexfile, "R ") < 0)
 				error (1, errno, "cannot write %s", entexfilename);
 
-			write_ent_proc (node, NULL);
 			write_ent_ex_proc (node, NULL);
 
 			if (fclose (entfile) == EOF)
@@ -296,7 +279,6 @@ void Rename_Entry (List *list, const char *from, const char *to)
 			if (fprintf (entexfile, "R ") < 0)
 				error (1, errno, "cannot write %s", entexfilename);
 
-			write_ent_proc (node, NULL);
 			write_ent_ex_proc (node, NULL);
 
 			xfree(ent->user);
@@ -307,7 +289,6 @@ void Rename_Entry (List *list, const char *from, const char *to)
 			if (fprintf (entexfile, "A ") < 0)
 				error (1, errno, "cannot write %s", entexfilename);
 
-			write_ent_proc (node, NULL);
 			write_ent_ex_proc (node, NULL);
 
 			if (fclose (entfile) == EOF)
@@ -419,7 +400,10 @@ void Register (List *list, const char *fname, const char *vn, const char *ts, co
 		if (fprintf (entexfile, "A ") < 0)
 			error (1, errno, "cannot write %s", entexfilename);
 
-		write_ent_proc (node, NULL);
+		/* write_ent_ex_proc writes both the Entries line and the
+		   Entries.Extra line (exactly as write_entries relies on when it
+		   walks the list with it), so a separate write_ent_proc call here
+		   would write the Entries record a second time.  */
 		write_ent_ex_proc (node, NULL);
 
 		if (fclose (entfile) == EOF)
@@ -444,24 +428,24 @@ static void freesdt (Node *p)
 /* Return the next real Entries line.  On end of file, returns NULL.
    On error, prints an error message and returns NULL.  */
 
-static Entnode *fgetentent(FILE *fpin, char *cmd, int *sawdir)
+/* LINEP/LINE_ALLOCATED is a getline buffer owned by the caller, so one
+   buffer serves every record of an Entries scan instead of one
+   malloc/free pair per record.  Entnode_Create copies what it needs, so
+   nothing points into the buffer after return.  */
+static Entnode *fgetentent(FILE *fpin, char *cmd, int *sawdir,
+			   char **linep, size_t *line_allocated)
 {
     Entnode *ent;
-    char *line;
-    size_t line_chars_allocated;
     register char *cp;
     enum ent_type type;
     char *l, *user, *vn, *ts, *options;
     char *tag_or_date, *tag, *date, *ts_conflict;
     int line_length;
 
-    line = NULL;
-    line_chars_allocated = 0;
-
     ent = NULL;
-    while ((line_length = getline (&line, &line_chars_allocated, fpin)) > 0)
+    while ((line_length = getline (linep, line_allocated, fpin)) > 0)
     {
-	l = line;
+	l = *linep;
 
 	/* If CMD is not NULL, we are reading an Entries.Log file.
 	   Each line in the Entries.Log file starts with a single
@@ -570,28 +554,23 @@ static Entnode *fgetentent(FILE *fpin, char *cmd, int *sawdir)
     if (line_length < 0 && !feof (fpin))
 	error (0, errno, "cannot read entries file");
 
-    xfree (line);
     return ent;
 }
 
 /* Merge the Entries.Extra data */
-static int fgetententex(List *entries, FILE *fpin, char *cmd)
+static int fgetententex(List *entries, FILE *fpin, char *cmd,
+			char **linep, size_t *line_allocated)
 {
     Entnode *ent;
 	Node *node;
-    char *line;
-    size_t line_chars_allocated;
     register char *cp;
     char *l, *user, *tag1, *tag2, *rcs_timestamp_string, *edit_revision, *edit_tag, *edit_bugid, *md5;
     int line_length;
 
-    line = NULL;
-    line_chars_allocated = 0;
-
     ent = NULL;
-    while ((line_length = getline (&line, &line_chars_allocated, fpin)) > 0)
+    while ((line_length = getline (linep, line_allocated, fpin)) > 0)
     {
-	l = line;
+	l = *linep;
 
 	/* If CMD is not NULL, we are reading an Entries.Log file.
 	   Each line in the Entries.Log file starts with a single
@@ -701,7 +680,6 @@ static int fgetententex(List *entries, FILE *fpin, char *cmd)
 	break;
 	}
 
-	xfree(line);
 	return ent?0:-1;
 }
 
@@ -808,6 +786,8 @@ List *Entries_Open (int aflag, const char *update_dir)
     int do_rewrite = 0;
     FILE *fpin;
     int sawdir;
+    char *line = NULL;
+    size_t line_allocated = 0;
 
 	TRACE(3,"Entries_Open()");
     /* get a fresh list... */
@@ -850,7 +830,8 @@ List *Entries_Open (int aflag, const char *update_dir)
     else if(fpin)
     {
 	TRACE(3,"Entries_Open CVS_FOPEN CVSADM_ENT returned a file handle, now call the (slow) fgetentent() / AddEntryNode");
-	while ((ent = fgetentent (fpin, (char *) NULL, &sawdir)) != NULL) 
+	while ((ent = fgetentent (fpin, (char *) NULL, &sawdir,
+				  &line, &line_allocated)) != NULL)
 	{
 	    (void) AddEntryNode (entrieslist, ent);
 	}
@@ -872,7 +853,7 @@ List *Entries_Open (int aflag, const char *update_dir)
     else if(fpin)
     {
 		TRACE(3,"Entries_Open CVS_FOPEN CVSADM_ENTEXT returned a file handle");
-		while (!fgetententex (entrieslist,fpin,NULL)) 
+		while (!fgetententex (entrieslist,fpin,NULL,&line,&line_allocated))
 			;
 		TRACE(3,"Entries_Open fclose() CVSADM_ENTEXT ");
 		if (fclose (fpin) < 0)
@@ -888,7 +869,8 @@ List *Entries_Open (int aflag, const char *update_dir)
 	Node *node;
 
 	TRACE(3,"Entries_Open CVS_FOPEN CVSADM_ENTLOG returned a file handle");
-	while ((ent = fgetentent (fpin, &cmd, &sawdir)) != NULL)
+	while ((ent = fgetentent (fpin, &cmd, &sawdir,
+				  &line, &line_allocated)) != NULL)
 	{
 	    switch (cmd)
 	    {
@@ -943,6 +925,7 @@ List *Entries_Open (int aflag, const char *update_dir)
 
     /* clean up and return */
 	TRACE(3,"Entries_Open clean up and return ");
+    xfree (line);
     if (dirtag)
 	xfree (dirtag);
     if (dirdate)

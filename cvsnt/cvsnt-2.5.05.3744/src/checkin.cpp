@@ -16,6 +16,7 @@
  */
 
 #include "cvs.h"
+#include "access_log.h"
 #include "fileattr.h"
 #include "edit.h"
 
@@ -60,7 +61,6 @@ int Checkin (int type, struct file_info *finfo, char *rcs, char *rev, char *tag,
 		strcpy(cp,cp+2);
 	}
 
-    CXmlNodePtr node;
     switch (RCS_checkin (finfo->rcs, finfo->file, message, rev, options, RCS_FLAGS_KEEPFILE, merge_from_tag1, merge_from_tag2, callback, NULL, bugid, &variable_list))
     {
 	case 0:			/* everything normal */
@@ -107,15 +107,15 @@ int Checkin (int type, struct file_info *finfo, char *rcs, char *rev, char *tag,
 	     * If we want read-only files, muck the permissions here, before
 	     * getting the file time-stamp.
 	     */
-	    node = fileattr_getroot();
-	    node->xpathVariable("file",finfo->file);
-	    if (!(commit_keep_edits && edit_revision) && (!cvswrite || (node->Lookup("file[cvs:filename(@name,$file)]/watched") && node->XPathResultNext()) || (kf.flags&KFLAG_RESERVED_EDIT)))
+	    if (!(commit_keep_edits && edit_revision) && (!cvswrite || fileattr_iswatched(finfo->file) || (kf.flags&KFLAG_RESERVED_EDIT)))
 			xchmod (finfo->file, 0);
 
 	    /* Re-register with the new data.  */
 	    vers = Version_TS (finfo, NULL, tag, NULL, 1, set_time, 0);
 	    history_write (type, NULL, vers->vn_rcs,
 			   finfo->file, finfo->repository,bugid,message);
+	    access_log_file ("write", type == 'A' ? "add" : "modify", finfo->update_dir, finfo->repository,
+			     finfo->file, vers->vn_rcs, tag, NULL, 0);
 
 		{
 			CMD5Calc *md5 = NULL;
@@ -126,7 +126,7 @@ int Checkin (int type, struct file_info *finfo, char *rcs, char *rev, char *tag,
 				FILE *cf = CVS_FOPEN(finfo->file,"r");
 				if(!cf)
 				{
-					error(1,errno,"Unable to reopen %s for checksum");
+					error(1,errno,"Unable to reopen %s for checksum",fn_root(finfo->file));
 				}
 				CVS_FSEEK(cf,0,SEEK_END);
 				if(CVS_FTELL(cf)>=server_checksum_threshold)

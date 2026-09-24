@@ -961,10 +961,11 @@ static int do_file_proc (Node *p, void *closure)
 	xfree (mapped_name);
 	xfree (mapped_file_repository);
 
-    /* Allow the user to monitor progress with tail -f.  Doing this once
-       per file should be no big deal, but we don't want the performance
-       hit of flushing on every line like previous versions of CVS.  */
-    cvs_flushout ();
+    /* Allow the user to monitor progress with tail -f.  In server mode
+       the flush is skipped while next to nothing is pending, so small
+       files batch into full network writes; any staged text or a full
+       chunk still flushes here, once per file.  */
+    cvs_flushout_perfile ();
 
     return (ret);
 }
@@ -1148,12 +1149,32 @@ static int do_dir_proc (Node *p, void *closure)
 		strcat (cvsadmdir, CVSADM_ENT);
 		if (!isfile (cvsadmdir))
 		{
-		    /* Some commands like update may have printed "? foo" but
-		       if we were planning to recurse, and don't on account of
-		       CVS/Repository, we want to say why.  */
-		    error (1, 0, "while updating %s, %s is missing (%s). If intentional, create empty Entries to get all files.", update_dir,
-			   CVSADM_ENT, cvsadmdir);
-		    dir_return = R_SKIP_ALL;
+		    /* --recreate-entries: write the empty Entries the message
+		       below prescribes and carry on; every file in the
+		       directory is then fetched again.  An empty file (not a
+		       lone "D" line) keeps subdirectory information unknown,
+		       so on-disk subdirectories are still found and
+		       recursed into.  */
+		    extern int recreate_entries;
+		    FILE *fp;
+
+		    if (recreate_entries && !noexec
+			&& (fp = CVS_FOPEN (cvsadmdir, "w+")) != NULL)
+		    {
+			if (fclose (fp) == EOF)
+			    error (1, errno, "cannot close %s", cvsadmdir);
+			error (0, 0, "recreated missing %s in %s; files there will be fetched again",
+			       CVSADM_ENT, update_dir);
+		    }
+		    else
+		    {
+			/* Some commands like update may have printed "? foo" but
+			   if we were planning to recurse, and don't on account of
+			   CVS/Repository, we want to say why.  */
+			error (1, 0, "while updating %s, %s is missing (%s). If intentional, create empty Entries to get all files.", update_dir,
+			       CVSADM_ENT, cvsadmdir);
+			dir_return = R_SKIP_ALL;
+		    }
 		}
 	    }
 	}

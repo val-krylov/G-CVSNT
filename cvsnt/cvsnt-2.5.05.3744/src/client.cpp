@@ -1190,6 +1190,7 @@ warning: server is not creating directories one at a time");
 static void copy_a_file (char *data, List *ent_list, char *short_pathname, char *filename)
 {
     char *newname;
+    extern int backup_local_files;
 
     read_line (&newname);
 
@@ -1199,7 +1200,11 @@ static void copy_a_file (char *data, List *ent_list, char *short_pathname, char 
     if (last_component (newname) != newname)
 	error (1, 0, "protocol error: Copy-file tried to specify directory");
 
-    copy_file (filename, newname, 1, 1);
+    /* The server cannot know that backups are disabled on this side, so it
+       still sends Copy-file before a merge; accept the response but write
+       nothing when update -n / --no-backups was given.  */
+    if (backup_local_files)
+	copy_file (filename, newname, 1, 1);
     xfree (newname);
 }
 
@@ -1411,6 +1416,18 @@ enum existp_t
 	UPDATE_ENTRIES_EXISTING_OR_NEW
 };
 
+extern int move_in_the_way;
+
+/* --move-in-the-way: try to clear an unversioned file obstructing an
+   incoming one by renaming it aside (rename_notversioned_aside owns the
+   case-ambiguity exemption).  Returns 1 when the path is now clear.  */
+static int clear_obstruction (const char *filename, const char *short_pathname)
+{
+    if (!move_in_the_way)
+	return 0;
+    return rename_notversioned_aside (filename, short_pathname);
+}
+
 struct update_entries_data
 {
     enum contents_t contents;
@@ -1536,12 +1553,18 @@ static void update_entries (char *data_arg, List *ent_list, char *short_pathname
 	    error (0, 0, "warning: %s unexpectedly disappeared",
 		   short_pathname);
 
+	/* An unversioned file where a new one goes.  The rename is a
+	   statement, so the guards decide whether it is tried at all.  */
+	int obstructed = data->existp == UPDATE_ENTRIES_NEW && !client_overwrite_existing && isfile (filename);
+	if (obstructed && clear_obstruction (filename, short_pathname))
+	    obstructed = 0;
+
 	if (filenames_case_insensitive && client_overwrite_existing && isfile(filename) && !case_isfile(filename,&realfilename))
 	{
 		xfree(realfilename);
 	}
 	else
-	if (data->existp == UPDATE_ENTRIES_NEW && !client_overwrite_existing && isfile (filename))
+	if (obstructed)
 	{
 	    /* Emit a warning and refuse to update the file; we don't want
 	       to clobber a user's file.  */
@@ -2399,11 +2422,16 @@ static void update_blob_ref_entries (char *data_arg, List *ent_list, char *short
         error (0, 0, "warning: %s unexpectedly disappeared",
     	   short_pathname);
 
+    /* As in update_entries: the rename is a statement, not a conjunct.  */
+    int obstructed = data->existp == UPDATE_ENTRIES_NEW && !client_overwrite_existing && isfile (filename);
+    if (obstructed && clear_obstruction (filename, short_pathname))
+        obstructed = 0;
+
     if (filenames_case_insensitive && client_overwrite_existing && isfile(filename) && !case_isfile(filename,&realfilename))
     {
     	xfree(realfilename);
     }
-    else if (data->existp == UPDATE_ENTRIES_NEW && !client_overwrite_existing && isfile (filename))
+    else if (obstructed)
     {
       if (filenames_case_insensitive && !case_isfile(filename,&realfilename))
       {
@@ -5290,7 +5318,14 @@ struct send_data
     int backup_modified;
 	int modified;
 	int case_sensitive;
+    int kopt_by_content;
 };
+
+static const char *send_declared_kopt;
+void send_files_declared_kopt (const char *kopt)
+{
+    send_declared_kopt = kopt;
+}
 
 extern int backup_local_files;
 /* Deal with one file.  */
@@ -5422,6 +5457,24 @@ static int send_fileproc (void *callerdat, struct file_info *finfo)
 
 		if(modified)
 		{
+			/* A fresh add whose bytes look binary: the Kopt goes with this
+			   file's own Is-modified, in the Directory send_files already
+			   selected, so the server's dummy entry keeps it whatever else
+			   the command spans.  */
+			/* add owns refusal in refuse_binary_as_text, so the verdict here is
+			   only KEEP or BINARY.  */
+			const char *forced;
+			if (args->kopt_by_content && vers->vn_user == NULL
+			    && content_kopt (finfo->file, send_declared_kopt, 0, &forced) == CONTENT_KOPT_BINARY)
+			{
+				if (!supported_request ("Kopt"))
+				    error (1, 0, "%s has binary content, and this server takes no per-file kopt; add it with -kB",
+					   fn_root(finfo->fullname));
+				error (0, 0, "%s has binary content, adding it as -k%s", fn_root(finfo->fullname), forced);
+				send_to_server ("Kopt -k", 0);
+				send_to_server (forced, 0);
+				send_to_server ("\n", 1);
+			}
 			if (args->no_contents && supported_request ("Is-modified"))
 			{
 				send_to_server ("Is-modified ", 0);
@@ -5958,6 +6011,7 @@ void send_files (int argc, char **argv, int local, int aflag, unsigned int flags
     args.no_contents = flags & SEND_NO_CONTENTS;
     args.blob_contents = !(flags & SEND_NO_BLOBS_CONTENT);
     args.backup_modified = flags & BACKUP_MODIFIED_FILES;
+    args.kopt_by_content = flags & SEND_KOPT_BY_CONTENT;
     err = start_recursion
 	(send_fileproc, send_filesdoneproc, (PREDIRENTPROC) NULL,
 	 send_dirent_proc, send_dirleave_proc, (void *) &args,
@@ -6019,6 +6073,25 @@ int client_process_import_file(const char *message, const char *vfile, const cha
     send_a_repository ("", repository, update_dir);
 	vers.options = wrap_rcsoption(vfile);
 	assign_options(&vers.options,options);
+	/* Content beats name; a forced B must reach the server or the file
+	   would be stored as text.  */
+	const char *forced;
+	switch (content_kopt (vfile, vers.options, options && options[0], &forced))
+	{
+	case CONTENT_KOPT_REFUSE:
+		error (1, 0, "%s has binary content; refusing to import it with -k%s (use -kB)",
+		       vfile, options);
+	case CONTENT_KOPT_BINARY:
+		xfree (vers.options);
+		vers.options = xstrdup (forced);
+		error (0, 0, "%s has binary content, importing it as -k%s", vfile, forced);
+		if (!supported_request ("Kopt"))
+			error (1, 0, "%s has binary content, and this server takes no per-file kopt; import with -kB",
+			       vfile);
+		break;
+	default:
+		break;
+	}
     if (vers.options != NULL)
     {
 		if (supported_request ("Kopt"))

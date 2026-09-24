@@ -320,7 +320,10 @@ struct kflag
 
 char *RCS_check_kflag (const char *arg, bool allow_modify, bool error);
 bool RCS_get_kflags(const char *arg, bool err, kflag& result);
+/* Whether KOPT (Entries/-k form, no leading -k) selects a binary mode. */
+bool kopt_is_binary(const char *kopt);
 char *RCS_rebuild_options(kflag* kf, char *options);
+void RCS_write_binary_rev_data(const char *context, char * &data, size_t &len, bool guessed_compression, bool write_it);
 char *RCS_getdate (RCSNode * rcs, const char *date, int force_tag_match);
 char *RCS_gettag (RCSNode *rcs, const char *symtag, int force_tag_match, int *simple_tag);
 int RCS_isfloating(RCSNode *rcs, const char *rev);
@@ -370,7 +373,14 @@ void RCS_addaccess (RCSNode *, char *);
 void RCS_delaccess (RCSNode *, char *);
 char *RCS_getaccess (RCSNode *);
 RETSIGTYPE rcs_cleanup (int sig);
-void RCS_rewrite (RCSNode *rcs, Deltatext *newdtext, char *insertpt, int compress_new_delta);
+void RCS_rewrite (RCSNode *rcs, Deltatext *newdtext, char *insertpt, int compress_new_delta, bool reparse = true);
+/* Discard form: the caller makes no further use of the node before it is
+   freed.  The refcount guard inside still re-parses shared nodes.  Safe
+   because free_rcsnode_contents leaves the node in the state a later
+   freercsnode expects: every free_* flag cleared and the buffer-backed
+   pointers dropped, so the second teardown frees nothing twice.  */
+inline void RCS_rewrite_final (RCSNode *rcs, Deltatext *newdtext, char *insertpt, int compress_new_delta)
+{ RCS_rewrite (rcs, newdtext, insertpt, compress_new_delta, false); }
 int rcs_change_text (const char *, char *, size_t, const char *,
 			    size_t, char **, size_t *);
 void RCS_deltas (RCSNode *, FILE *, struct rcsbuffer *, const char *,

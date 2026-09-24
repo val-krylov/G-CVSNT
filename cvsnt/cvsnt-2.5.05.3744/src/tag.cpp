@@ -13,6 +13,7 @@
  */
 
 #include "cvs.h"
+#include "access_log.h"
 #include "savecwd.h"
 
 static int rtag_proc(int argc, char **argv, const char *xwhere,
@@ -31,7 +32,7 @@ static Dtype tag_dirproc(void *callerdat, char *dir,
 				 char *repos, char *update_dir,
 				 List *entries, const char *virtual_repository, Dtype hint);
 static int rtag_fileproc(void *callerdat, struct file_info *finfo);
-static int rtag_delete(RCSNode *rcsfile);
+static int rtag_delete(struct file_info *finfo, RCSNode *rcsfile);
 static int tag_fileproc(void *callerdat, struct file_info *finfo);
 static int add_to_valtags(char *name);
 
@@ -130,6 +131,7 @@ int cvstag (int argc, char **argv)
     int c;
     int err = 0;
     int run_module_prog = 1;
+    const char *tag_type;
 
     is_rtag = (strcmp (command_name, "rtag") == 0);
     
@@ -279,7 +281,10 @@ int cvstag (int argc, char **argv)
         return get_responses_and_close ();
     }
 
-	lock_for_write = 1;
+	/* lock_for_write is raised around the second recursion pass in
+	   rtag_proc, which is the only pass that rewrites ,v files; the
+	   validation pass only reads and takes read locks.  */
+    tag_type = delete_flag ? "D" : (numtag ? numtag : (date ? date : "A"));
     if (is_rtag)
     {
 	DBM *db;
@@ -288,8 +293,7 @@ int cvstag (int argc, char **argv)
 	for (i = 0; i < argc; i++)
 	{
 	    /* XXX last arg should be repository, but doesn't make sense here */
-	    history_write ('T', (delete_flag ? "D" : (numtag ? numtag : 
-			   (date ? date : "A"))), symtag, argv[i], "", NULL, NULL);
+	    history_write ('T', tag_type, symtag, argv[i], "", NULL, NULL);
 	    err += do_module (db, argv[i], TAG,
 			      delete_flag ? "Untagging" : "Tagging",
 			      rtag_proc, (char *) NULL, 0, 0, run_module_prog,
@@ -299,10 +303,18 @@ int cvstag (int argc, char **argv)
     }
     else
     {
+	int i;
+	/* Same convention as the rtag write above: for T records the
+	   update_dir slot carries the tag type and lands in the record's
+	   repos field; the record logs the tag command, before it runs,
+	   exactly as rtag's does.  */
+	for (i = 0; i < argc; i++)
+	    history_write ('T', tag_type, symtag, argv[i], "", NULL, NULL);
+	if (!argc)
+	    history_write ('T', tag_type, symtag, ".", "", NULL, NULL);
 	err = rtag_proc (argc + 1, argv - 1, NULL, NULL, NULL, 0, 0, NULL,
 			 NULL);
     }
-	lock_for_write = 0;
 
     Lock_Cleanup ();
     return (err);
@@ -427,11 +439,15 @@ static int rtag_proc(int argc, char **argv, const char *xwhere,
 	tag_set_ok = 0;
 
 	current_date = date_from_time_t(global_session_time_t);
-    /* start the recursion processor */
+    /* start the recursion processor.  Only this pass rewrites ,v files,
+       so only this pass asks rcsbuf_open for exclusive per-file locks;
+       the validation pass above ran with read locks.  */
+	lock_for_write = 1;
     err = start_recursion (is_rtag ? rtag_fileproc : tag_fileproc,
 			   (FILESDONEPROC) NULL, (PREDIRENTPROC) NULL, tag_dirproc,
 			   (DIRLEAVEPROC) NULL, NULL, argc - 1, argv + 1,
 			   local, which, 0, 0, where, repository, 1, verify_tag, numtag);
+	lock_for_write = 0;
 	xfree(current_date);
     dellist (&mtlist);
     if (where != NULL)
@@ -682,7 +698,7 @@ static int rtag_fileproc (void *callerdat, struct file_info *finfo)
      */
 
     if (delete_flag)
-		return rtag_delete (rcsfile);
+		return rtag_delete (finfo, rcsfile);
 
 	if(numtag && !date && alias_branch)
 	{
@@ -714,7 +730,7 @@ static int rtag_fileproc (void *callerdat, struct file_info *finfo)
 	if (version == NULL)
 	{
 		/* Clean up any old tags */
-		rtag_delete (rcsfile);
+		rtag_delete (finfo, rcsfile);
 
 		if (!quiet && !force_tag_match)
 		{
@@ -745,8 +761,10 @@ static int rtag_fileproc (void *callerdat, struct file_info *finfo)
 					PATCH_NULL(symtag),
 					PATCH_NULL(numtag),
 					PATCH_NULL(current_date) );
-			RCS_rewrite (rcsfile, NULL, NULL, 0);
+			RCS_rewrite_final (rcsfile, NULL, NULL, 0);
 			tag_set_ok = 1;
+			access_log_file ("write", branch_mode ? "branch" : "tag", finfo->update_dir, finfo->repository,
+					 finfo->file, numtag, symtag, NULL, 0);
 		}
     }
     else
@@ -808,8 +826,10 @@ static int rtag_fileproc (void *callerdat, struct file_info *finfo)
 					PATCH_NULL(symtag),
 					PATCH_NULL(rev),
 					PATCH_NULL(current_date) );
-	    RCS_rewrite (rcsfile, NULL, NULL, 0);
+	    RCS_rewrite_final (rcsfile, NULL, NULL, 0);
 		tag_set_ok = 1;
+		access_log_file ("write", branch_mode ? "branch" : "tag", finfo->update_dir, finfo->repository,
+				 finfo->file, rev, symtag, NULL, 0);
 	}
     }
 
@@ -843,7 +863,7 @@ static int rtag_fileproc (void *callerdat, struct file_info *finfo)
  * This is done here because it's MUCH faster than just blindly calling
  * "rcs" to remove the tag... trust me.
  */
-static int rtag_delete (RCSNode *rcsfile)
+static int rtag_delete (struct file_info *finfo, RCSNode *rcsfile)
 {
     char *version;
     int retcode;
@@ -890,7 +910,8 @@ static int rtag_delete (RCSNode *rcsfile)
 	return (1);
     }
 	TRACE(3,"rtag_delete(2) rewrite rcsfile");
-    RCS_rewrite (rcsfile, NULL, NULL, 0);
+    RCS_rewrite_final (rcsfile, NULL, NULL, 0);
+    access_log_file ("write", "untag", finfo->update_dir, finfo->repository, finfo->file, NULL, symtag, NULL, 0);
     return (0);
 }
 
@@ -1046,6 +1067,7 @@ static int tag_fileproc (void *callerdat, struct file_info *finfo)
 					PATCH_NULL(vers->srcfile->path),
 					PATCH_NULL(symtag) );
 	RCS_rewrite (vers->srcfile, NULL, NULL, 0);
+	access_log_file ("write", "untag", finfo->update_dir, finfo->repository, finfo->file, NULL, symtag, NULL, 0);
 
 	/* warm fuzzies */
 	if (!really_quiet)
@@ -1193,15 +1215,22 @@ static int tag_fileproc (void *callerdat, struct file_info *finfo)
 	else
 		tag_set_ok = 1;
 	TRACE(3,"tag_fileproc - finally RCS_settag ok");
-	history_write ('T', finfo->update_dir, rev, finfo->file, finfo->repository, NULL, NULL);
-    if (branch_mode)
-	xfree (rev);
+	{
+		/* Copy the revision before branch_mode frees rev below, so a branch
+		   record keeps its magic branch number instead of an empty rev. */
+		cvs::string al_rev = rev ? rev : "";
+		const char *al_kind = branch_mode ? "branch" : "tag";
+		if (branch_mode)
+			xfree (rev);
 	TRACE(3,"tag_fileproc(2) rewrite rcsfile=\"%s\" symtag=\"%s\", rev=\"%s\", date=\"%s\"",
 					PATCH_NULL(vers->srcfile->path),
 					PATCH_NULL(symtag),
 					PATCH_NULL(rev),
 					PATCH_NULL(current_date) );
     RCS_rewrite (vers->srcfile, NULL, NULL, 0);
+		access_log_file ("write", al_kind, finfo->update_dir, finfo->repository,
+				 finfo->file, al_rev.c_str (), symtag, NULL, 0);
+	}
 
     /* more warm fuzzies */
     if (!really_quiet)
